@@ -1,0 +1,9 @@
+# Ignore
+target/
+*.class
+*.log
+*.jar
+!nextjs-rce-scanner-1.0.0.jar
+.idea/
+*.iml
+.DS_Store
