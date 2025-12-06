@@ -1,13 +1,19 @@
 ## CVE-2025-55182 Next.js RCE Burp 扩展
 
+## 🔥 Features
+
 ### 功能
 
 - **被动扫描**: 自动检测所有经过 Burp 的 Next.js 站点
+- **双重检测**: [新增] 同时执行 **Echo** 和 **DNSLog** (Burp Collaborator) 检测，确保不漏报
+- **UI 改进**: 日志区域可调整大小
 - **自动利用**: 发现漏洞后自动执行 `id` 和 `uname -a` 获取系统信息
 - **结果列表**: 表格形式展示所有漏洞站点
-![alt text](image.png)
+![alt text](image-2.png)
 - **命令执行**: 右键表格可对目标执行自定义命令
-![alt text](image-1.png)
+- **Scanner 集成**: Findings are also reported to Burp Scanner as High severity issues
+- **右键菜单 (Context Menu)**: Right-click any request to manually test for the vulnerability
+
 ### 安装
 
 1. 下载 `nextjs-rce-scanner-1.0.0.jar`

